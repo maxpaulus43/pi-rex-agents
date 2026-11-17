@@ -166,7 +166,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const tell = (content: string) =>
-    pi.sendMessage({ customType: "rex-agent", content, display: true }, { triggerTurn: true, deliverAs: "followUp" });
+    pi.sendMessage({ customType: "rex-agent", content, display: true }, { triggerTurn: true, deliverAs: "steer" });
 
   const onClosed = async (a: Agent) => {
     a.alive = false;
