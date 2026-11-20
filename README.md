@@ -4,8 +4,10 @@ Named pi subagents that run in Rex panes. Each agent is a normal interactive pi,
 
 ## Install
 
+From the repository root, run:
+
 ```sh
-pi install /Users/maxpaulus/c/pi-rex-agents
+pi install "$PWD"
 ```
 
 For agents on another Rex host, install it there too. Update both hosts together so they use the same result handoff format.
@@ -31,7 +33,7 @@ The extension reads one markdown file per agent from `agents/` in this package, 
 name: scout
 description: Fast read-only recon
 kind: scout            # scout = read-only tools + web; worker = every tool
-model: claude-code/claude-sonnet-5-5   # optional; if you leave it out, the agent uses the master's model
+# model: provider/model  # optional; defaults to the parent agent's model
 thinking: low          # optional
 tools: read, grep      # optional allowlist that replaces the kind's default
 ---

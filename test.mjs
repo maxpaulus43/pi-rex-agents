@@ -6,7 +6,7 @@ import extension, { parseAgentFile, piCommand } from "./index.ts";
 test("agent files parse, and scouts are read-only", () => {
   const scout = parseAgentFile(readFileSync(new URL("./agents/scout.md", import.meta.url), "utf8"), "x");
   assert.equal(scout.kind, "scout");
-  assert.equal(scout.model, "claude-code/claude-sonnet-5-5");
+  assert.equal(scout.model, undefined);
   assert.ok(scout.tools?.length, "the built-in scout declares its allowlist");
   const worker = parseAgentFile(readFileSync(new URL("./agents/worker.md", import.meta.url), "utf8"), "x");
   assert.equal(worker.kind, "worker");
