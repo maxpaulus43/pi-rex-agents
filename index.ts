@@ -4,8 +4,10 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { MouseRegion, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -30,6 +32,7 @@ interface Agent {
   name: string;
   id: string; // pi session id, also names the result file
   def: AgentDef;
+  resultId?: string;
   host?: string;
   cwd?: string;
   model?: string;
@@ -62,6 +65,7 @@ export function parseAgentFile(text: string, fallbackName: string): AgentDef {
 export function piCommand(a: Agent, task: string | undefined, extPath?: string): string[] {
   const intro = `You are ${a.name}, a ${a.def.kind} subagent started by a parent agent. Your final message is returned to the parent. If you cannot continue without a decision, call ask_parent.`;
   const args = ["env", `PI_REX_AGENT_ID=${a.id}`, "pi", "--session-id", a.id, "--name", a.name];
+  if (a.resultId) args.splice(2, 0, `PI_REX_RESULT_ID=${a.resultId}`);
   if (a.model) args.push("--model", a.model);
   if (a.thinking) args.push("--thinking", a.thinking);
   args.push("--append-system-prompt", `${intro}\n\n${a.def.prompt}`.trim());
@@ -83,6 +87,7 @@ const lastAssistantText = (messages: any[]) => {
 export default function (pi: ExtensionAPI) {
   const agents = new Map<string, Agent>();
   const watchers = new Map<string, ChildProcess>();
+  const pendingCleanup = new Map<string, Agent>();
   let ui: ExtensionContext["ui"] | undefined;
 
   const rex = async (host: string | undefined, args: string[]) => {
@@ -95,14 +100,41 @@ export default function (pi: ExtensionAPI) {
 
   const showStatus = () => {
     const live = [...agents.values()].filter((a) => a.alive);
-    ui?.setStatus("rex-agents", live.length ? live.map((a) => `${a.name}:${a.state ?? "?"}`).join(" ") : undefined);
+    if (!live.length) return ui?.setWidget("rex-agents", undefined);
+    ui?.setWidget("rex-agents", (_tui, theme) => {
+      const heading = "Agents:";
+      let end = heading.length;
+      const links = live.map((agent) => {
+        const label = stripVTControlCharacters(`${agent.name}:${agent.state ?? "?"}`).replace(/\p{Cc}/gu, " ");
+        const start = end + 1;
+        end = start + visibleWidth(label);
+        return { agent, block: agent.block, label, start, end };
+      });
+      // Pi forwards clicks to the widget row, not to nested labels.
+      return new MouseRegion({
+        render: (width) => [truncateToWidth([heading, ...links.map(({ label }) => theme.fg("accent", label))].join(" "), width)],
+        invalidate() {},
+      }, (event) => {
+        if (event.button !== "left") return;
+        const link = links.find(({ start, end }) => event.x >= start && event.x < end);
+        if (!link?.agent.alive || !link.block || link.agent.block !== link.block || !link.agent.session) return;
+        if (event.type === "press") return { handled: true, render: false };
+        if (event.type !== "click") return;
+        const { agent, block } = link;
+        void api(agent.host, agent.session!, "session.focus_block", { block_id: block }).catch(() => {
+          ui?.notify(`Could not focus agent ${agent.name}.`, "warning");
+        });
+        return { handled: true };
+      });
+    });
   };
 
   // ---- child side: this pi was spawned by a parent ----
   const childId = process.env.PI_REX_AGENT_ID;
   if (childId) {
-    const resultFile = join(getAgentDir(), "rex-agents", `${childId}.md`);
-    pi.on("session_start", () => rmSync(resultFile, { force: true }));
+    const resultId = process.env.PI_REX_RESULT_ID ?? childId;
+    const resultFile = join(getAgentDir(), "rex-agents", `${resultId}.md`);
+    if (resultId === childId) pi.on("session_start", () => rmSync(resultFile, { force: true }));
     pi.on("agent_end", (event) => {
       mkdirSync(dirname(resultFile), { recursive: true });
       writeFileSync(resultFile, lastAssistantText(event.messages));
@@ -144,36 +176,72 @@ export default function (pi: ExtensionAPI) {
     return defs;
   };
 
-  const readResult = async (a: Agent) => {
-    if (!a.host) {
-      const file = join(getAgentDir(), "rex-agents", `${a.id}.md`);
-      return existsSync(file) ? readFileSync(file, "utf8") : "";
-    }
-    // Remote: print the file as base64 in a detached (invisible) block, then capture it.
-    const script = `printf '<<%s>>' "$(cat "$HOME/.pi/agent/rex-agents/${a.id}.md" 2>/dev/null | base64 | tr -d '\\n')"`;
+  const remoteResult = async (a: Agent, remove = false) => {
+    const id = a.resultId ?? a.id;
+    if (!/^[\da-f-]{36}$/i.test(id)) throw new Error("Invalid result ID");
+    const file = `"$HOME/.pi/agent/rex-agents/${id}.md"`;
+    const script = remove
+      ? `rm -f ${file} && printf '<<>>'`
+      : `[ ! -f ${file} ] && printf '<<>>' || { data=$(base64 < ${file}) && printf '<<%s>>' "$data"; }`;
     const { block_id } = await api(a.host, a.session!, "session.new_block", {
       flavor: SHELL,
       options: { shell: "none", command: ["sh", "-c", script], exit: { on_completion: false } },
     });
     try {
-      await rex(a.host, ["wait", "-s", a.session!, block_id, "--for", "20s"]).catch(() => {});
+      await rex(a.host, ["wait", "-s", a.session!, block_id, "--for", "20s"]);
       const out = await rex(a.host, ["capture", "-s", a.session!, "-b", block_id, "--unwrap"]);
-      const b64 = out.replace(/\s/g, "").match(/<<([A-Za-z0-9+/=]*)>>/)?.[1] ?? "";
+      const b64 = out.replace(/\s/g, "").match(/<<([A-Za-z0-9+/=]*)>>/)?.[1];
+      if (b64 === undefined) throw new Error("Could not confirm remote result operation");
       return Buffer.from(b64, "base64").toString("utf8");
     } finally {
       await rex(a.host, ["block", "close", "-s", a.session!, block_id]).catch(() => {});
     }
   };
 
-  const tell = (content: string) =>
-    pi.sendMessage({ customType: "rex-agent", content, display: true }, { triggerTurn: true, deliverAs: "steer" });
+  const localResult = (a: Agent) => join(getAgentDir(), "rex-agents", `${a.resultId ?? a.id}.md`);
+  const readResult = async (a: Agent) => {
+    if (a.host) return remoteResult(a);
+    const file = localResult(a);
+    return existsSync(file) ? readFileSync(file, "utf8") : "";
+  };
+
+  const cleanupResults = async (_event: unknown, ctx: ExtensionContext) => {
+    if (!pendingCleanup.size) return;
+    // sendMessage can queue a reply. Wait for a turn boundary with the reply in the session log.
+    for (const entry of ctx.sessionManager.getEntries()) {
+      if (entry.type !== "custom_message" || entry.customType !== "rex-agent" || typeof entry.details !== "string") continue;
+      const a = pendingCleanup.get(entry.details);
+      if (!a) continue;
+      pendingCleanup.delete(entry.details);
+      try {
+        if (a.host) await remoteResult(a, true);
+        else rmSync(localResult(a), { force: true });
+      } catch {
+        ui?.notify(`Could not remove the saved result for ${a.name}.`, "warning");
+      }
+    }
+  };
+  pi.on("turn_end", cleanupResults);
+  pi.on("agent_settled", cleanupResults);
+
+  const tell = (content: string, resultId?: string) =>
+    pi.sendMessage({ customType: "rex-agent", content, display: true, details: resultId }, { triggerTurn: true, deliverAs: "steer" });
 
   const onClosed = async (a: Agent) => {
     a.alive = false;
     a.state = "closed";
     showStatus();
-    const result = await readResult(a).catch((e) => `(could not read result: ${e.message})`);
-    tell(`Agent ${a.name} settled and closed its pane. Result:\n\n${result.slice(0, 50_000) || "(no result)"}`);
+    const closed = { ...a };
+    let cleanupId: string | undefined;
+    const result = await readResult(closed).then((text) => {
+      // A resumed agent uses a new handoff file. Keep old or partially delivered replies.
+      if (closed.resultId && text.length <= 50_000) {
+        cleanupId = closed.resultId;
+        pendingCleanup.set(cleanupId, closed);
+      }
+      return text;
+    }, (e) => `(could not read result: ${e.message})`);
+    tell(`Agent ${a.name} settled and closed its pane. Result:\n\n${result.slice(0, 50_000) || "(no result)"}`, cleanupId);
   };
 
   const onEvent = (line: string) => {
@@ -237,12 +305,20 @@ export default function (pi: ExtensionAPI) {
     const session = !a.host && process.env.REX_SESSION ? process.env.REX_SESSION : await agentsSession(a.host);
     watch(a.host, session);
     a.session = session;
+    a.resultId = randomUUID();
     const r = await place(a, session, piCommand(a, task, a.host ? undefined : join(HERE, "index.ts")));
     Object.assign(a, { block: r.block_ids[0], alive: true, state: "starting", asked: undefined });
     agents.set(a.name, a);
     const { alive, state, asked, ...saved } = a;
     pi.appendEntry("rex-agent", saved);
     showStatus();
+    if (a.placement !== "float") return a.placement;
+    try {
+      await api(a.host, session, "session.set_layer_state", { layer_id: r.layer_id, state: "minimized" });
+      return "minimized float";
+    } catch {
+      return "float (could not minimize)";
+    }
   };
 
   pi.on("session_start", (_event, ctx) => {
@@ -271,8 +347,8 @@ export default function (pi: ExtensionAPI) {
     name: "agent_spawn",
     label: "Spawn Agent",
     description:
-      "Start a named subagent in its own Rex pane. Returns at once. The agent's final result arrives later as a message; questions it asks arrive the same way. Scouts are read-only (files and web). Workers can use every tool and spawn scouts.",
-    promptSnippet: "Spawn a named scout (read-only) or worker subagent in a Rex pane",
+      "Start a named subagent in a separate interactive terminal. Returns at once. The agent's final result arrives later as a message; questions it asks arrive the same way. Scouts are read-only (files and web). Workers can use every tool and spawn scouts.",
+    promptSnippet: "Spawn a named scout (read-only) or worker subagent in a separate interactive terminal",
     promptGuidelines: [
       "Use agent_spawn to delegate independent work. Results and questions from agents arrive automatically; do not poll with agent_list.",
       "Refer to subagents by name. Use agent_send to answer an agent's question or to send a follow-up; it resumes a settled agent.",
@@ -281,8 +357,8 @@ export default function (pi: ExtensionAPI) {
       task: Type.String({ description: "Self-contained task. The agent does not see this conversation." }),
       agent: Type.Optional(Type.String({ description: "Agent definition name, such as scout or worker. Default: worker" })),
       name: Type.Optional(Type.String({ description: "Unique short name. Default: picked automatically" })),
-      placement: Type.Optional(StringEnum(["split", "float", "window"] as const, { description: "Default: split" })),
-      host: Type.Optional(Type.String({ description: "Rex host label to run on another machine (see `rex hosts`)" })),
+      placement: Type.Optional(StringEnum(["split", "float", "window"] as const, { description: "Terminal layout. Floats start minimized. Default: float in the current session, otherwise window." })),
+      host: Type.Optional(Type.String({ description: "Host label for running on another machine" })),
       model: Type.Optional(Type.String({ description: "provider/model override" })),
       cwd: Type.Optional(Type.String({ description: "Working directory. Default: this one (home on other hosts)" })),
     }),
@@ -301,10 +377,10 @@ export default function (pi: ExtensionAPI) {
         cwd: p.cwd ?? (p.host ? undefined : ctx.cwd),
         model: p.model ?? def.model ?? (inherit ? `${ctx.model!.provider}/${ctx.model!.id}` : undefined),
         thinking: def.thinking ?? (inherit ? pi.getThinkingLevel() : undefined),
-        placement: (p.placement as Placement | undefined) ?? "split",
+        placement: (p.placement as Placement | undefined) ?? (!p.host && process.env.REX_SESSION ? "float" : "window"),
       };
-      await launch(a, p.task);
-      const where = `${a.placement}${a.host ? ` on ${a.host}` : ""}`;
+      const placement = await launch(a, p.task);
+      const where = `${placement}${a.host ? ` on ${a.host}` : ""}`;
       return { content: [{ type: "text", text: `Spawned ${name} (${def.name}, ${def.kind}) in a ${where}.` }], details: { name } };
     },
   });
