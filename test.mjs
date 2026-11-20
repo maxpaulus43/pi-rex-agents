@@ -7,6 +7,7 @@ test("agent files parse, and scouts are read-only", () => {
   const scout = parseAgentFile(readFileSync(new URL("./agents/scout.md", import.meta.url), "utf8"), "x");
   assert.equal(scout.kind, "scout");
   assert.equal(scout.model, "claude-code/claude-sonnet-5-5");
+  assert.ok(scout.tools?.length, "the built-in scout declares its allowlist");
   const worker = parseAgentFile(readFileSync(new URL("./agents/worker.md", import.meta.url), "utf8"), "x");
   assert.equal(worker.kind, "worker");
   assert.equal(worker.model, undefined);
@@ -16,6 +17,8 @@ test("agent files parse, and scouts are read-only", () => {
 
   const cmd = piCommand({ name: "ada", id: "id1", def: scout, model: scout.model, placement: "split" }, "find X", "/ext.ts");
   const tools = cmd[cmd.indexOf("--tools") + 1].split(",");
+  const fallback = piCommand({ name: "ada", id: "id1", def: { ...scout, tools: undefined }, placement: "split" }, undefined);
+  assert.equal(tools.join(","), fallback[fallback.indexOf("--tools") + 1]);
   for (const t of ["bash", "edit", "write", "agent_spawn"]) assert.ok(!tools.includes(t), t);
   assert.ok(tools.includes("web_search") && tools.includes("ask_parent"));
   assert.ok(cmd.includes("--no-mcp"));
