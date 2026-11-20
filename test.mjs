@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { parseAgentFile, piCommand } from "./index.ts";
+import extension, { parseAgentFile, piCommand } from "./index.ts";
 
 test("agent files parse, and scouts are read-only", () => {
   const scout = parseAgentFile(readFileSync(new URL("./agents/scout.md", import.meta.url), "utf8"), "x");
@@ -27,4 +27,29 @@ test("agent files parse, and scouts are read-only", () => {
   const w = piCommand({ name: "bo", id: "id2", def: worker, placement: "split" }, undefined);
   assert.ok(!w.includes("--tools") && !w.includes("--no-mcp") && !w.includes("--"));
   assert.deepEqual(w.slice(0, 4), ["env", "PI_REX_AGENT_ID=id2", "pi", "--session-id"]);
+});
+
+test("parallel spawns reserve the first unused name for each definition", async () => {
+  const tools = new Map();
+  const pending = [];
+  extension({
+    on() {},
+    registerTool: (tool) => tools.set(tool.name, tool),
+    exec: () => new Promise((_, reject) => pending.push(reject)),
+  });
+  const ctx = { isProjectTrusted: () => false };
+  const spawn = (agent, name) => tools.get("agent_spawn").execute("", { agent, name, host: "test", task: "test" }, undefined, undefined, ctx);
+  const scout1 = assert.rejects(spawn("scout"), /launch failed/);
+  const scout2 = assert.rejects(spawn("scout"), /launch failed/);
+  const worker1 = assert.rejects(spawn("worker"), /launch failed/);
+  const duplicates = [
+    assert.rejects(spawn("scout", "scout-1"), /Name "scout-1" is taken/),
+    assert.rejects(spawn("scout", "scout-2"), /Name "scout-2" is taken/),
+    assert.rejects(spawn("worker", "worker-1"), /Name "worker-1" is taken/),
+  ];
+  for (const reject of pending.splice(0)) reject(new Error("launch failed"));
+  await Promise.all([scout1, scout2, worker1, ...duplicates]);
+  const retry = assert.rejects(spawn("scout", "scout-1"), /launch failed/);
+  pending[0](new Error("launch failed"));
+  await retry;
 });

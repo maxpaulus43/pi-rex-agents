@@ -14,7 +14,6 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REX = process.env.REX_BIN_DIR ? join(process.env.REX_BIN_DIR, "rex") : "rex";
 const SHELL = "com.superlogical.terminal.shell";
 const SCOUT_TOOLS = ["read", "grep", "find", "ls", "web_enable", "web_search", "fetch_content", "get_search_content", "source_check"];
-const NAMES = ["ada", "bo", "cleo", "dex", "eve", "finn", "gus", "hana", "ivy", "jax", "kai", "lux", "mo", "nia", "oz", "pip", "quin", "sol", "tia", "uma", "vic", "wren", "yuri", "zed"];
 
 export interface AgentDef {
   name: string;
@@ -356,7 +355,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       task: Type.String({ description: "Self-contained task. The agent does not see this conversation." }),
       agent: Type.Optional(Type.String({ description: "Agent definition name, such as scout or worker. Default: worker" })),
-      name: Type.Optional(Type.String({ description: "Unique short name. Default: picked automatically" })),
+      name: Type.Optional(Type.String({ description: "Unique short name. Default: first unused name like scout-1" })),
       placement: Type.Optional(StringEnum(["split", "float", "window"] as const, { description: "Terminal layout. Floats start minimized. Default: float in the current session, otherwise window." })),
       host: Type.Optional(Type.String({ description: "Host label for running on another machine" })),
       model: Type.Optional(Type.String({ description: "provider/model override" })),
@@ -366,7 +365,12 @@ export default function (pi: ExtensionAPI) {
       const defs = loadDefs(ctx);
       const def = defs.get(p.agent ?? "worker");
       if (!def) throw new Error(`Unknown agent "${p.agent}". Available: ${[...defs.keys()].join(", ")}`);
-      const name = p.name ?? NAMES.find((n) => !agents.has(n)) ?? `agent-${agents.size + 1}`;
+      let name = p.name;
+      if (name === undefined) {
+        let n = 1;
+        while (agents.has(`${def.name}-${n}`)) n++;
+        name = `${def.name}-${n}`;
+      }
       if (agents.has(name)) throw new Error(`Name "${name}" is taken`);
       const inherit = !p.model && !def.model && ctx.model;
       const a: Agent = {
@@ -379,7 +383,14 @@ export default function (pi: ExtensionAPI) {
         thinking: def.thinking ?? (inherit ? pi.getThinkingLevel() : undefined),
         placement: (p.placement as Placement | undefined) ?? (!p.host && process.env.REX_SESSION ? "float" : "window"),
       };
-      const placement = await launch(a, p.task);
+      agents.set(name, a);
+      let placement: string;
+      try {
+        placement = await launch(a, p.task);
+      } catch (error) {
+        agents.delete(name);
+        throw error;
+      }
       const where = `${placement}${a.host ? ` on ${a.host}` : ""}`;
       return { content: [{ type: "text", text: `Spawned ${name} (${def.name}, ${def.kind}) in a ${where}.` }], details: { name } };
     },
@@ -393,6 +404,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, { name, message }) {
       const a = agents.get(name);
       if (!a) throw new Error(`No agent "${name}". Known: ${[...agents.keys()].join(", ") || "none"}`);
+      if (!a.block) throw new Error(`Agent "${name}" is still starting.`);
       if (a.alive) {
         try {
           await rex(a.host, ["send", "-s", a.session!, "-b", a.block!, "--", message]);
