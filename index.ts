@@ -286,8 +286,16 @@ export default function (pi: ExtensionAPI) {
     const layout = { block: { flavor: SHELL, label: a.name, options: { command, cwd: a.cwd, interactive: true } } };
     const local = !a.host && session === process.env.REX_SESSION;
     if (a.placement === "float") {
+      let window_id: string | undefined;
+      if (local) {
+        const block_id = process.env.REX_BLOCK;
+        if (!block_id) throw new Error("Could not identify the parent Rex pane (REX_BLOCK is missing).");
+        const { block } = await api(a.host, session, "session.describe_block", { block_id });
+        window_id = block.window_id;
+        if (!window_id) throw new Error("The parent Rex pane is not in a tab.");
+      }
       const k = [...agents.values()].filter((x) => x.alive && x.placement === "float").length % 5;
-      return api(a.host, session, "session.new_layer", { bounds: [0.05 + 0.04 * k, 0.05 + 0.04 * k, 0.6, 0.7], layout, focus: false });
+      return api(a.host, session, "session.new_layer", { window_id, bounds: [0.05 + 0.04 * k, 0.05 + 0.04 * k, 0.6, 0.7], layout, focus: false });
     }
     // First split goes right of the parent; later ones stack below the newest live sibling.
     const sibling = [...agents.values()].reverse().find((x) => x !== a && x.alive && x.placement === "split" && x.host === a.host && x.session === session);

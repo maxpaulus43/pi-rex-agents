@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import extension, { parseAgentFile, piCommand } from "./index.ts";
 
@@ -27,6 +31,49 @@ test("agent files parse, and scouts are read-only", () => {
   const w = piCommand({ name: "bo", id: "id2", def: worker, placement: "split" }, undefined);
   assert.ok(!w.includes("--tools") && !w.includes("--no-mcp") && !w.includes("--"));
   assert.deepEqual(w.slice(0, 4), ["env", "PI_REX_AGENT_ID=id2", "pi", "--session-id"]);
+});
+
+test("local floats target the parent pane's tab, not the active tab", async (t) => {
+  const env = { REX_SESSION: "session:test", REX_BLOCK: "block:parent" };
+  const saved = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  const watcher = Object.assign(new EventEmitter(), { stdout: new PassThrough() });
+  t.mock.method(childProcess, "spawn", () => watcher);
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    watcher.stdout.end();
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  let spawnAgent;
+  const calls = [];
+  extension({
+    on() {},
+    appendEntry() {},
+    registerTool: (tool) => { if (tool.name === "agent_spawn") spawnAgent = tool.execute; },
+    async exec(_bin, [, , , , method, json]) {
+      const body = JSON.parse(json);
+      calls.push(method);
+      let result = {};
+      if (method === "session.describe_block") {
+        assert.equal(body.block_id, env.REX_BLOCK);
+        result = { block: { window_id: "window:A" } };
+      } else if (method === "session.new_layer") {
+        assert.equal(body.window_id, "window:A"); // Without this, Rex would use the active tab B.
+        assert.equal(body.focus, false);
+        result = { block_ids: ["block:child"], layer_id: "layer:child" };
+      }
+      return { code: 0, stdout: JSON.stringify(result) };
+    },
+  });
+  const result = await spawnAgent("", { task: "test" }, undefined, undefined, { isProjectTrusted: () => false });
+  assert.match(result.content[0].text, /minimized float/);
+  assert.deepEqual(calls, ["session.describe_block", "session.new_layer", "session.set_layer_state"]);
 });
 
 test("parallel spawns reserve the first unused name for each definition", async () => {
