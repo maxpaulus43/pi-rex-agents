@@ -2,6 +2,8 @@
 
 Named pi subagents that run in Rex panes. Each agent is a normal interactive pi, so you can click into its pane and talk to it.
 
+https://github.com/user-attachments/assets/9ce0cfee-fc05-4f1a-a3a1-b5405a7c0efb
+
 ## Install
 
 From the repository root, run:
