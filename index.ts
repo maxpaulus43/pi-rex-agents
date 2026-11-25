@@ -282,14 +282,12 @@ export default function (pi: ExtensionAPI) {
     return JSON.parse(await rex(host, ["api", "call", "session.create", '{"label":"pi-agents"}'])).session_id as string;
   };
 
-  const place = async (a: Agent, session: string, command: string[]) => {
+  const place = async (a: Agent, session: string, command: string[], local: boolean) => {
     const layout = { block: { flavor: SHELL, label: a.name, options: { command, cwd: a.cwd, interactive: true } } };
-    const local = !a.host && session === process.env.REX_SESSION;
     if (a.placement === "float") {
       let window_id: string | undefined;
-      if (local) {
-        const block_id = process.env.REX_BLOCK;
-        if (!block_id) throw new Error("Could not identify the parent Rex pane (REX_BLOCK is missing).");
+      const block_id = local ? process.env.REX_BLOCK : undefined;
+      if (block_id) {
         const { block } = await api(a.host, session, "session.describe_block", { block_id });
         window_id = block.window_id;
         if (!window_id) throw new Error("The parent Rex pane is not in a tab.");
@@ -308,12 +306,20 @@ export default function (pi: ExtensionAPI) {
     return api(a.host, session, "session.new_window", { window_label: a.name, layout, focus: false });
   };
 
+  // Rex sets REX_BLOCK but no longer REX_SESSION, so ask it which session our pane is in.
+  let ownSession: Promise<string | undefined> | undefined;
+  const own = () =>
+    process.env.REX_BLOCK
+      ? (ownSession ??= rex(undefined, ["whoami", "--json"]).then((s) => JSON.parse(s).session_id ?? undefined).catch(() => undefined))
+      : Promise.resolve(undefined);
+
   const launch = async (a: Agent, task: string | undefined) => {
-    const session = !a.host && process.env.REX_SESSION ? process.env.REX_SESSION : await agentsSession(a.host);
+    const here = a.host ? undefined : await own();
+    const session = here ?? (await agentsSession(a.host));
     watch(a.host, session);
     a.session = session;
     a.resultId = randomUUID();
-    const r = await place(a, session, piCommand(a, task, a.host ? undefined : join(HERE, "index.ts")));
+    const r = await place(a, session, piCommand(a, task, a.host ? undefined : join(HERE, "index.ts")), here !== undefined);
     Object.assign(a, { block: r.block_ids[0], alive: true, state: "starting", asked: undefined });
     agents.set(a.name, a);
     const { alive, state, asked, ...saved } = a;
@@ -389,7 +395,7 @@ export default function (pi: ExtensionAPI) {
         cwd: p.cwd ?? (p.host ? undefined : ctx.cwd),
         model: p.model ?? def.model ?? (inherit ? `${ctx.model!.provider}/${ctx.model!.id}` : undefined),
         thinking: def.thinking ?? (inherit ? pi.getThinkingLevel() : undefined),
-        placement: (p.placement as Placement | undefined) ?? (!p.host && process.env.REX_SESSION ? "float" : "window"),
+        placement: (p.placement as Placement | undefined) ?? (!p.host && process.env.REX_BLOCK ? "float" : "window"),
       };
       agents.set(name, a);
       let placement: string;

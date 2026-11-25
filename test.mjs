@@ -34,7 +34,8 @@ test("agent files parse, and scouts are read-only", () => {
 });
 
 test("local floats target the parent pane's tab, not the active tab", async (t) => {
-  const env = { REX_SESSION: "session:test", REX_BLOCK: "block:parent" };
+  // Rex sets REX_BLOCK but no REX_SESSION; the session comes from `rex whoami`.
+  const env = { REX_BLOCK: "block:parent" };
   const saved = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
   Object.assign(process.env, env);
   const watcher = Object.assign(new EventEmitter(), { stdout: new PassThrough() });
@@ -56,7 +57,10 @@ test("local floats target the parent pane's tab, not the active tab", async (t) 
     on() {},
     appendEntry() {},
     registerTool: (tool) => { if (tool.name === "agent_spawn") spawnAgent = tool.execute; },
-    async exec(_bin, [, , , , method, json]) {
+    async exec(_bin, [command, ...rest]) {
+      if (command === "whoami") return { code: 0, stdout: JSON.stringify({ session_id: "session:test" }) };
+      const [method, json] = rest.slice(3);
+      assert.equal(rest[2], "session:test");
       const body = JSON.parse(json);
       calls.push(method);
       let result = {};
